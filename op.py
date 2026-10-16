@@ -5,10 +5,17 @@ registered under this pipeline and operator from MLflow, calls infer() for every
 message that matches a selector, and calls train() when there is no model yet or
 when need_retraining() says so. Training runs on Ray.
 
-infer() receives one inverter reading per message. It keeps the hourly means it
-has seen, and at the start of each hour it issues one forecast: the mean power for
-the hour 24 h ahead. The result carries that hour's timestamp, so the forecast is
-scored against the hour it is about.
+Three inputs arrive, each under its own selector:
+
+  - "value":    the inverter's total AC power, one reading per message.
+  - "forecast": the yr.no forecast, one cloud-cover value per forecasted hour.
+                Read live only; kept as the cloud term for the hour it is about.
+  - "history":  open-meteo observed cloud cover. Used by training only; infer
+                ignores it.
+
+At the start of each hour infer() closes the previous hour and issues one forecast:
+the mean power for the hour 24 h ahead. The result carries that hour's timestamp,
+so the forecast is scored against the hour it is about.
 
 Three methods are yours. Everything else — Kafka, the model registry, the
 lifecycle — belongs to the library.
@@ -17,6 +24,7 @@ lifecycle — belongs to the library.
 import datetime
 import typing
 
+import pandas as pd
 from mlflow.pyfunc import PyFuncModel, PythonModel
 
 from operator_lib.util import Config, MLOperator, Selector
@@ -37,6 +45,14 @@ def _utc_naive(ts: datetime.datetime) -> datetime.datetime:
     return ts
 
 
+def _hour_of(value) -> datetime.datetime:
+    """The start of the hour a timestamp (string or datetime) falls in, naive UTC."""
+    t = pd.Timestamp(value)
+    if t.tzinfo is not None:
+        t = t.tz_convert("UTC").tz_localize(None)
+    return t.floor("h").to_pydatetime()
+
+
 class CustomConfig(Config):
     """Deployment configuration, typed.
 
@@ -53,9 +69,10 @@ class CustomConfig(Config):
 class Operator(MLOperator):
     configType = CustomConfig
 
-    # The inverter's total AC power, in W, arrives as "value".
     selectors = [
         Selector({"name": "value", "args": ["value"]}),
+        Selector({"name": "forecast", "args": ["cloud_fc", "forecasted_for"]}),
+        Selector({"name": "history", "args": ["cloud_obs"]}),
     ]
 
     def init(self, *args, **kwargs):
@@ -67,6 +84,7 @@ class Operator(MLOperator):
         self._sum = 0.0  # sum of readings in that hour
         self._n = 0  # number of readings in that hour
         self._hourly: typing.Dict[datetime.datetime, typing.Optional[float]] = {}
+        self._cloud: typing.Dict[datetime.datetime, float] = {}  # forecast hour -> cloud %
         super().init(*args, **kwargs)
 
     def _seed(self, hour: datetime.datetime) -> None:
@@ -76,10 +94,11 @@ class Operator(MLOperator):
         datasets = provide_historic_data_local(datetime.timedelta(hours=SEED_HOURS))
         if not datasets:
             return
-        df = datasets[0].to_pandas()
-        if df.empty:
+        frames = [d.to_pandas() for d in datasets]
+        pv = next((f for f in frames if "value" in f.columns and not f.empty), None)
+        if pv is None:
             return
-        table = hourly_table(df)
+        table = hourly_table(pv, "value")
         for h, row in table.iterrows():
             h = h.to_pydatetime()
             if h > hour:
@@ -110,16 +129,33 @@ class Operator(MLOperator):
             self._hourly[self._hour] = 0.0 if float(sun_sin_elevation([self._hour])[0]) <= 0.0 else None
         self._trim(self._hour)
 
+    def _note_forecast(self, data: typing.Dict[str, typing.Any]) -> None:
+        """Keep the latest yr.no cloud forecast for each forecast hour."""
+        cloud = data.get("cloud_fc")
+        when = data.get("forecasted_for")
+        if cloud is None or when is None:
+            return
+        try:
+            target = _hour_of(when)
+        except (ValueError, TypeError):
+            return
+        self._cloud[target] = float(cloud)
+        if self._hour is not None:
+            for k in [k for k in self._cloud if k < self._hour]:
+                del self._cloud[k]
+
     def _issue(self, model: typing.Optional[PyFuncModel], hour: datetime.datetime):
         """Forecast the hour 24 h after the start of this hour."""
         if model is None:
             return None, None, None
         target = hour + datetime.timedelta(hours=24)
         lag_time = target - datetime.timedelta(hours=LAG_HOURS)
+        cloud_pct = self._cloud.get(target)
         payload = {
             "target": target,
             "lag_time": lag_time,
             "lag_value": self._hourly.get(lag_time),
+            "cloud": None if cloud_pct is None else cloud_pct / 100.0,
         }
         prediction = model.predict(payload)
         if prediction is None:
@@ -138,10 +174,16 @@ class Operator(MLOperator):
     ]:
         """Called for every message. Returns (result timestamp, result, new model).
 
-        Most messages only add to the current hour and return nothing. The first
-        message of each hour closes the previous hour and issues one forecast for
-        the hour 24 h ahead.
+        Forecast messages and historic cloud messages only update state. Inverter
+        readings add to the current hour; the first reading of each hour closes the
+        previous hour and issues one forecast for the hour 24 h ahead.
         """
+        if selector == "history":
+            return None, None, None
+        if selector == "forecast":
+            self._note_forecast(data)
+            return None, None, None
+
         value = data.get("value")
         if value is None:
             return None, None, None

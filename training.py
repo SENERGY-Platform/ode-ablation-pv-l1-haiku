@@ -2,19 +2,26 @@
 
 The target is the hourly mean of the inverter's total AC power, labelled by the
 start of the hour. The operator issues a forecast at the start of hour h for hour
-h + 24 h. The model uses four inputs, all known at issue time:
+h + 24 h. The model uses these inputs, all known at issue time:
 
   - lag:   the mean of the last completed hour, which is 25 h before the target
   - clim:  the mean daytime output for the target's month and hour, from training
   - sun:   the sine of the solar elevation at the target (clear-sky shape)
+  - cloud: the cloud cover fraction at the target hour (five-term model only)
   - a constant
 
-Hours with the sun below the horizon are forecast as zero. No weather is used in
-this version; cloud cover is the largest term still missing.
+Two fits are kept. The five-term fit uses cloud cover; the four-term fit does not
+and is the fallback when no cloud forecast is available for the target hour.
+
+Training uses observed cloud cover from the open-meteo history export. Inference
+uses the yr.no forecast for the target hour. These are different sources, so the
+cloud coefficient describes observed cloud and is applied to forecast cloud.
+
+Hours with the sun below the horizon are forecast as zero.
 
 provide_historic_data() is Operator Lib's reader over the platform's timeseries
-store. It returns Ray datasets with a "time" column (naive UTC) and a "value"
-column.
+store. It returns one Ray dataset per input topic, each with a "time" column
+(naive UTC) and one column per mapped destination.
 """
 
 import datetime
@@ -68,9 +75,9 @@ def _naive_utc(ts: datetime.datetime) -> datetime.datetime:
     return ts
 
 
-def hourly_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Hourly mean and sample count of the value column, indexed by hour start."""
-    s = df.set_index(pd.to_datetime(df["time"])).sort_index()["value"]
+def hourly_table(df: pd.DataFrame, column: str = "value") -> pd.DataFrame:
+    """Hourly mean and sample count of one column, indexed by hour start."""
+    s = df.set_index(pd.to_datetime(df["time"])).sort_index()[column]
     s = pd.to_numeric(s, errors="coerce").clip(lower=0)
     g = s.resample("h")
     return pd.DataFrame({"mean": g.mean(), "n": g.count()})
@@ -96,12 +103,14 @@ class PvForecastModel(PythonModel):
     """The model MLflow registers and op.py later loads.
 
     predict() receives one payload per issued forecast: the target hour, the lag
-    hour and its observed mean (None when that hour is unknown). It returns the
-    forecast mean power in W for the target hour.
+    hour and its observed mean (None when that hour is unknown), and the cloud
+    cover fraction forecast for the target hour (None when unavailable). It
+    returns the forecast mean power in W for the target hour.
     """
 
-    def __init__(self, coef, clim_cell: dict, clim_hour: dict) -> None:
-        self.coef = [float(c) for c in coef]
+    def __init__(self, coef4, coef5, clim_cell: dict, clim_hour: dict) -> None:
+        self.coef4 = [float(c) for c in coef4]
+        self.coef5 = None if coef5 is None else [float(c) for c in coef5]
         self.clim_cell = {(int(m), int(h)): float(v) for (m, h), v in clim_cell.items()}
         self.clim_hour = {int(h): float(v) for h, v in clim_hour.items()}
 
@@ -124,15 +133,31 @@ class PvForecastModel(PythonModel):
             lag = self._clim(lag_time)
         if clim is None or lag is None:
             return None
-        b0, b1, b2, b3 = self.coef
-        return float(max(b0 + b1 * float(lag) + b2 * clim + b3 * sun, 0.0))
+        cloud = payload.get("cloud")
+        if cloud is not None and self.coef5 is not None:
+            b = self.coef5
+            x = [1.0, float(lag), clim, sun, float(cloud)]
+        else:
+            b = self.coef4
+            x = [1.0, float(lag), clim, sun]
+        return float(max(sum(bi * xi for bi, xi in zip(b, x)), 0.0))
 
 
-def fit_model(df: pd.DataFrame):
-    """Fit the four-term linear model on daylight hours. Returns (model, mae, rows)."""
-    table = hourly_table(df)
+def _lstsq_fit(X: np.ndarray, y: np.ndarray):
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    mae = float(np.mean(np.abs(X @ coef - y)))
+    return coef, mae
+
+
+def fit_model(df_pv: pd.DataFrame, df_cloud: typing.Optional[pd.DataFrame] = None):
+    """Fit the four-term and five-term models on daylight hours.
+
+    Returns (model, mae4, mae5, rows4, rows5). mae5 and rows5 are None when no
+    observed cloud history was read or too few hours had both values.
+    """
+    table = hourly_table(df_pv, "value")
     if table.empty:
-        return None, None, 0
+        return None, None, None, 0, 0
     grid = pd.date_range(table.index.min().floor("h"), table.index.max().floor("h"), freq="h")
     y = table["mean"].reindex(grid).to_numpy(dtype=float)
     sun = sun_sin_elevation(grid)
@@ -151,13 +176,25 @@ def fit_model(df: pd.DataFrame):
     lag = np.where(np.isnan(lag), lag_clim, lag)
 
     mask = known & ~np.isnan(clim) & ~np.isnan(lag)
-    rows = int(mask.sum())
-    if rows < 100:
-        return None, None, rows
-    X = np.column_stack([np.ones(rows), lag[mask], clim[mask], sun[mask]])
-    coef, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
-    mae = float(np.mean(np.abs(X @ coef - y[mask])))
-    return PvForecastModel(coef, clim_cell, clim_hour), mae, rows
+    rows4 = int(mask.sum())
+    if rows4 < 100:
+        return None, None, None, rows4, 0
+    ones = np.ones(rows4)
+    X4 = np.column_stack([ones, lag[mask], clim[mask], sun[mask]])
+    coef4, mae4 = _lstsq_fit(X4, y[mask])
+
+    coef5, mae5, rows5 = None, None, 0
+    if df_cloud is not None and not df_cloud.empty and "cloud_obs" in df_cloud.columns:
+        cloud = hourly_table(df_cloud, "cloud_obs")["mean"].reindex(grid).to_numpy(dtype=float) / 100.0
+        cloud = np.clip(cloud, 0.0, 1.0)
+        mask5 = mask & ~np.isnan(cloud)
+        rows5 = int(mask5.sum())
+        if rows5 >= 100:
+            X5 = np.column_stack([np.ones(rows5), lag[mask5], clim[mask5], sun[mask5], cloud[mask5]])
+            coef5, mae5 = _lstsq_fit(X5, y[mask5])
+
+    model = PvForecastModel(coef4, coef5, clim_cell, clim_hour)
+    return model, mae4, mae5, rows4, rows5
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
@@ -171,10 +208,14 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
 
     with logger.trace("fit"):
         frames = [ray.get(d) if isinstance(d, ray.ObjectRef) else d for d in datasets]
-        df = frames[0].to_pandas()
-        if df.empty:
+        dfs = [f.to_pandas() for f in frames]
+        # Pick each input by the column it carries, not by its position: the
+        # topics are listed in the launch and the order is not a contract.
+        pv = next((d for d in dfs if "value" in d.columns and not d.empty), None)
+        cloud = next((d for d in dfs if "cloud_obs" in d.columns and not d.empty), None)
+        if pv is None:
             return None
-        model, mae, rows = fit_model(df)
+        model, mae4, mae5, rows4, rows5 = fit_model(pv, cloud)
         if model is None:
             return None
 
@@ -184,7 +225,15 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "longitude": LONGITUDE,
         "horizon_hours": 24,
         "lag_hours": LAG_HOURS,
-        "features": "intercept,lag,climatology,sun",
+        "features_4term": "intercept,lag,climatology,sun",
+        "features_5term": "intercept,lag,climatology,sun,cloud_obs",
+        "cloud_at_inference": "yr.no forecast instant_cloud_area_fraction",
     })
-    logger.log_metrics({"train_mae_w": mae, "train_daylight_hours": rows})
+    metrics = {"train_daylight_rows_4term": rows4}
+    if mae4 is not None:
+        metrics["train_mae_w_4term"] = mae4
+    if mae5 is not None:
+        metrics["train_mae_w_5term"] = mae5
+        metrics["train_daylight_rows_5term"] = rows5
+    logger.log_metrics(metrics)
     return model

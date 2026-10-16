@@ -14,8 +14,19 @@ deploymentType: local
 
 # What the pipeline editor offers as inputs. "name" has to match a selector arg in
 # op.py — the two together are how a message reaches infer().
+#
+#   value     the inverter's total AC power, W (device topic)
+#   cloud_fc  yr.no forecast cloud cover, % for a forecast hour (import topic)
+#   forecasted_for  the hour that forecast value is about (import topic)
+#   cloud_obs open-meteo observed cloud cover, % (import topic; training only)
 inputs:
   - name: value
+    type: float
+  - name: cloud_fc
+    type: float
+  - name: forecasted_for
+    type: string
+  - name: cloud_obs
     type: float
 
 # What the operator emits. These are the keys of the dictionary infer() returns.
