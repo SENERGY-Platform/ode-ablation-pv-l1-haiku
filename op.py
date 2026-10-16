@@ -17,6 +17,11 @@ At the start of each hour infer() closes the previous hour and issues one foreca
 the mean power for the hour 24 h ahead. The result carries that hour's timestamp,
 so the forecast is scored against the hour it is about.
 
+Each forecast carries two outputs: "prediction", the mean power in W, and
+"cloud_used", 1.0 when a yr.no cloud value was available for the target hour and
+0.0 when it was not. The model fits a cloud term only when training had observed
+cloud history; the training run's metrics say whether it did.
+
 Three methods are yours. Everything else — Kafka, the model registry, the
 lifecycle — belongs to the library.
 """
@@ -160,7 +165,11 @@ class Operator(MLOperator):
         prediction = model.predict(payload)
         if prediction is None:
             return None, None, None
-        return target.replace(tzinfo=datetime.timezone.utc), {"prediction": float(prediction)}, None
+        result = {
+            "prediction": float(prediction),
+            "cloud_used": 1.0 if cloud_pct is not None else 0.0,
+        }
+        return target.replace(tzinfo=datetime.timezone.utc), result, None
 
     def infer(
         self,

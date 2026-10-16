@@ -30,8 +30,13 @@ inputs:
     type: float
 
 # What the operator emits. These are the keys of the dictionary infer() returns.
+#
+#   prediction  mean power for the hour 24 h ahead, W
+#   cloud_used  1.0 when a yr.no cloud value was available for that hour, else 0.0
 outputs:
   - name: prediction
+    type: float
+  - name: cloud_used
     type: float
 
 # Deployment configuration, matching CustomConfig in op.py.
